@@ -161,16 +161,23 @@ async def _dedup_notebook_sources(
     except Exception:
         return imported
 
-    # Group by normalized URL; keep oldest entry per URL
-    url_to_ids: dict[str, list[str]] = {}
+    # Group by normalized dedup key: prefer src.url, fall back to title if it
+    # looks like a URL (the backend occasionally stores URLs in the title field
+    # and leaves the url field empty).
+    key_to_ids: dict[str, list[str]] = {}
     for src in current:
+        key = None
         if src.url:
-            url_to_ids.setdefault(_normalize_url(src.url), []).append(src.id)
+            key = _normalize_url(src.url)
+        elif src.title and ("://" in src.title or src.title.startswith("www.")):
+            key = _normalize_url(src.title)
+        if key:
+            key_to_ids.setdefault(key, []).append(src.id)
 
-    # Collect IDs to delete (all but the first/oldest per URL)
+    # Collect IDs to delete (all but the first/oldest per dedup key)
     to_delete: list[str] = []
     surviving_ids: set[str] = set()
-    for ids in url_to_ids.values():
+    for ids in key_to_ids.values():
         if len(ids) > 1:
             to_delete.extend(ids[1:])  # keep ids[0], delete rest
         surviving_ids.add(ids[0])
