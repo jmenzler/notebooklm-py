@@ -78,6 +78,28 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
+async def _probe_sources_with_settle(
+    client,
+    notebook_id: str,
+    *,
+    settle_delay: float = 1.5,
+):
+    """Probe sources.list with a one-shot settle retry.
+
+    The notebook backend transiently returns NoneType payloads for sources.list
+    immediately after a notebook is created or a write is in flight; the SDK
+    silently converts that to an empty list. Re-probing once after a brief delay
+    catches the common transient and is cheap.
+
+    Returns the list of Source objects (possibly empty).
+    """
+    result = await client.sources.list(notebook_id)
+    if result:
+        return result
+    await asyncio.sleep(settle_delay)
+    return await client.sources.list(notebook_id)
+
+
 def _normalize_url(url: str) -> str:
     """Lowercase scheme + host and strip a trailing slash for comparison.
 
@@ -165,13 +187,15 @@ async def import_with_retry(
     # sources reported as "imported" by this call.
     requested_has_no_url_entry = _has_no_url_entry(sources)
 
-    # Snapshot baseline source IDs so the post-timeout probe can identify
-    # truly-new sources. We anchor the verified-success condition on URLs of
-    # *new* sources — not on a baseline→current URL delta — so concurrent
-    # additions from another session and pre-existing URLs cannot satisfy it.
+    # Snapshot baseline source URLs and IDs. URLs drive pre-import dedup and
+    # the post-timeout verified-success condition; IDs filter the return value
+    # to only the truly new sources — avoiding false positives from pre-existing
+    # or concurrently-added rows.
+    baseline_urls: set[str] | None
     baseline_ids: set[str] | None
     try:
         baseline = await client.sources.list(notebook_id)
+        baseline_urls = {src.url for src in baseline if src.url}
         baseline_ids = {src.id for src in baseline}
     except (NetworkError, RPCError) as snapshot_exc:
         logger.warning(
@@ -180,7 +204,66 @@ async def import_with_retry(
             notebook_id,
             snapshot_exc,
         )
+        baseline_urls = None
         baseline_ids = None
+
+    # Pre-import dedup. Deep research frequently surfaces the same URL across
+    # multiple sub-queries, and --import-all would otherwise import every copy.
+    # Filter the input batch to drop sources whose URL is already in the
+    # notebook (baseline) or appears more than once within the input batch.
+    if baseline_urls is not None:
+        baseline_urls_norm = {_normalize_url(u) for u in baseline_urls}
+        to_import: list[dict] = []
+        seen_urls_norm: set[str] = set()
+        skipped_existing = 0
+        skipped_within_batch = 0
+        for s in sources:
+            url_norm = _source_url_norm(s)
+            if url_norm is not None:
+                if url_norm in baseline_urls_norm:
+                    skipped_existing += 1
+                    continue
+                if url_norm in seen_urls_norm:
+                    skipped_within_batch += 1
+                    continue
+                seen_urls_norm.add(url_norm)
+            to_import.append(s)
+
+        if not to_import:
+            logger.info(
+                "All %d candidate sources for notebook %s are already present; "
+                "skipping import call",
+                len(sources),
+                notebook_id,
+            )
+            if not json_output:
+                console.print(
+                    f"[yellow]All {len(sources)} candidate sources already "
+                    f"present in notebook; nothing to import.[/yellow]"
+                )
+            return []
+
+        if len(to_import) != len(sources):
+            pre_filtered = len(sources) - len(to_import)
+            logger.info(
+                "Pre-filtered %d sources (%d already-present, %d batch-internal "
+                "dupes): %d → %d",
+                pre_filtered,
+                skipped_existing,
+                skipped_within_batch,
+                len(sources),
+                len(to_import),
+            )
+            if not json_output:
+                console.print(
+                    f"[dim]Pre-filtered {pre_filtered} sources "
+                    f"({skipped_existing} already-present, "
+                    f"{skipped_within_batch} batch-internal dupes) "
+                    f"→ importing {len(to_import)}[/dim]"
+                )
+            sources = to_import
+            requested_urls_norm = _requested_urls_norm(sources)
+            requested_has_no_url_entry = _has_no_url_entry(sources)
 
     while True:
         try:
@@ -195,7 +278,7 @@ async def import_with_retry(
             # server-side write; retrying then duplicates every source.
             if baseline_ids is not None and requested_urls_norm:
                 try:
-                    current = await client.sources.list(notebook_id)
+                    current = await _probe_sources_with_settle(client, notebook_id)
                     new_sources = [src for src in current if src.id not in baseline_ids]
                     new_urls_norm = {_normalize_url(src.url) for src in new_sources if src.url}
                     current_urls_norm = {_normalize_url(src.url) for src in current if src.url}
