@@ -78,26 +78,41 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
-async def _probe_sources_with_settle(
+async def _settle_sources(
     client,
     notebook_id: str,
     *,
-    settle_delay: float = 1.5,
-):
-    """Probe sources.list with a one-shot settle retry.
+    poll_interval: float = 3.0,
+    max_settle: float = 60.0,
+) -> list:
+    """Poll sources.list until the count stabilizes.
 
-    The notebook backend transiently returns NoneType payloads for sources.list
-    immediately after a notebook is created or a write is in flight; the SDK
-    silently converts that to an empty list. Re-probing once after a brief delay
-    catches the common transient and is cheap.
+    After IMPORT_RESEARCH, the notebook backend may transiently return
+    NoneType (→ []) or may still be writing sources in the background,
+    so a single sources.list() call can miss in-flight entries.  This
+    polls every *poll_interval* seconds until the list is non-empty and
+    the length hasn't changed for two consecutive polls, or until
+    *max_settle* seconds have elapsed.
 
-    Returns the list of Source objects (possibly empty).
+    Returns the stable list of Source objects (possibly empty on timeout).
     """
-    result = await client.sources.list(notebook_id)
-    if result:
-        return result
-    await asyncio.sleep(settle_delay)
-    return await client.sources.list(notebook_id)
+    started = time.monotonic()
+    prev_len: int | None = None
+    stable_count = 0
+    while True:
+        result = await client.sources.list(notebook_id)
+        cur_len = len(result) if result else 0
+        if prev_len is not None and cur_len == prev_len and cur_len > 0:
+            stable_count += 1
+            if stable_count >= 2:
+                return result
+        else:
+            stable_count = 0
+        prev_len = cur_len
+        elapsed = time.monotonic() - started
+        if elapsed >= max_settle:
+            return result
+        await asyncio.sleep(poll_interval)
 
 
 def _normalize_url(url: str) -> str:
@@ -136,6 +151,53 @@ def _has_no_url_entry(sources: list[dict]) -> bool:
 
 def _imported_source_entry(source: "Source") -> dict[str, str]:
     return {"id": source.id, "title": source.title or source.url or ""}
+
+
+async def _dedup_notebook_sources(
+    client,
+    notebook_id: str,
+    imported: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Delete duplicate sources from the notebook, keeping the oldest entry.
+
+    Returns the deduplicated imported list (only entries whose server-side
+    source survived the dedup).
+    """
+    try:
+        current = await client.sources.list(notebook_id)
+    except Exception:
+        return imported
+
+    # Group by normalized URL; keep oldest entry per URL
+    url_to_ids: dict[str, list[str]] = {}
+    for src in current:
+        if src.url:
+            url_to_ids.setdefault(_normalize_url(src.url), []).append(src.id)
+
+    # Collect IDs to delete (all but the first/oldest per URL)
+    to_delete: list[str] = []
+    surviving_ids: set[str] = set()
+    for ids in url_to_ids.values():
+        if len(ids) > 1:
+            to_delete.extend(ids[1:])  # keep ids[0], delete rest
+        surviving_ids.add(ids[0])
+
+    if not to_delete:
+        return imported
+
+    logger.info(
+        "Post-import dedup: deleting %d duplicate source(s) for notebook %s",
+        len(to_delete),
+        notebook_id,
+    )
+    for source_id in to_delete:
+        try:
+            await client.sources.delete(notebook_id, source_id)
+        except Exception:
+            pass  # best-effort — don't fail the import over a dedup delete
+
+    # Filter imported list to only surviving sources
+    return [entry for entry in imported if entry.get("id") in surviving_ids]
 
 
 def _merge_imported_sources(
@@ -268,7 +330,8 @@ async def import_with_retry(
     while True:
         try:
             imported = await client.research.import_sources(notebook_id, task_id, sources)
-            return _merge_imported_sources(imported, verified_imported, verified_imported_ids)
+            merged = _merge_imported_sources(imported, verified_imported, verified_imported_ids)
+            return await _dedup_notebook_sources(client, notebook_id, merged)
         except RPCTimeoutError:
             elapsed = time.monotonic() - started_at
             remaining = max_elapsed - elapsed
@@ -278,7 +341,7 @@ async def import_with_retry(
             # server-side write; retrying then duplicates every source.
             if baseline_ids is not None and requested_urls_norm:
                 try:
-                    current = await _probe_sources_with_settle(client, notebook_id)
+                    current = await _settle_sources(client, notebook_id)
                     new_sources = [src for src in current if src.id not in baseline_ids]
                     new_urls_norm = {_normalize_url(src.url) for src in new_sources if src.url}
                     current_urls_norm = {_normalize_url(src.url) for src in current if src.url}
@@ -311,9 +374,10 @@ async def import_with_retry(
                             if (src.url and _normalize_url(src.url) in requested_urls_norm)
                             or (not src.url and requested_has_no_url_entry)
                         ]
-                        return _merge_imported_sources(
+                        merged = _merge_imported_sources(
                             imported, verified_imported, verified_imported_ids
                         )
+                        return await _dedup_notebook_sources(client, notebook_id, merged)
                     source_norms = [(source, _source_url_norm(source)) for source in sources]
                     removed_urls_norm = {
                         url
@@ -350,9 +414,10 @@ async def import_with_retry(
                                     "requested sources are already present — "
                                     "skipping retry.[/yellow]"
                                 )
-                            return _merge_imported_sources(
+                            merged = _merge_imported_sources(
                                 [], verified_imported, verified_imported_ids
                             )
+                            return await _dedup_notebook_sources(client, notebook_id, merged)
                         logger.warning(
                             "IMPORT_RESEARCH timed out for notebook %s after "
                             "%d requested source(s) were already present; retrying "
