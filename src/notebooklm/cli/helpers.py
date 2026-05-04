@@ -163,7 +163,8 @@ async def _dedup_notebook_sources(
 
     # Group by normalized dedup key: prefer src.url, fall back to title if it
     # looks like a URL (the backend occasionally stores URLs in the title field
-    # and leaves the url field empty).
+    # and leaves the url field empty).  Non-URL sources (research reports,
+    # pasted text) are grouped by plain title in a second pass.
     key_to_ids: dict[str, list[str]] = {}
     for src in current:
         key = None
@@ -171,6 +172,8 @@ async def _dedup_notebook_sources(
             key = _normalize_url(src.url)
         elif src.title and ("://" in src.title or src.title.startswith("www.")):
             key = _normalize_url(src.title)
+        else:
+            key = src.title  # dedup non-URL sources by title
         if key:
             key_to_ids.setdefault(key, []).append(src.id)
 
