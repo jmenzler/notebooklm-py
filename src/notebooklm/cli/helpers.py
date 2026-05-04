@@ -85,33 +85,26 @@ async def _settle_sources(
     poll_interval: float = 3.0,
     max_settle: float = 60.0,
 ) -> list:
-    """Poll sources.list until the count stabilizes.
+    """Poll sources.list until no source is still processing.
 
     After IMPORT_RESEARCH, the notebook backend may transiently return
-    NoneType (→ []) or may still be writing sources in the background,
-    so a single sources.list() call can miss in-flight entries.  This
-    polls every *poll_interval* seconds until the list is non-empty and
-    the length hasn't changed for two consecutive polls, or until
-    *max_settle* seconds have elapsed.
+    NoneType (→ []) or may still be writing/processing sources in the
+    background.  Rather than guessing via count stability, check individual
+    source status: keep polling until the list is non-empty AND no source
+    has status PROCESSING (1) or PREPARING (5).
 
-    Returns the stable list of Source objects (possibly empty on timeout).
+    Returns the settled list of Source objects.
     """
     started = time.monotonic()
-    prev_len: int | None = None
-    stable_count = 0
     while True:
         result = await client.sources.list(notebook_id)
-        cur_len = len(result) if result else 0
-        if prev_len is not None and cur_len == prev_len and cur_len > 0:
-            stable_count += 1
-            if stable_count >= 2:
+        if result:
+            active = sum(1 for s in result if getattr(s, "status", 2) in (1, 5))
+            if active == 0:
                 return result
-        else:
-            stable_count = 0
-        prev_len = cur_len
         elapsed = time.monotonic() - started
         if elapsed >= max_settle:
-            return result
+            return result or []
         await asyncio.sleep(poll_interval)
 
 
