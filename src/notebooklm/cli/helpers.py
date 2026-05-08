@@ -216,6 +216,17 @@ def _merge_imported_sources(
     ]
 
 
+# When a retry would land while the server is still processing the prior
+# batch, the IMPORT_RESEARCH RPC rejects with gRPC FAILED_PRECONDITION (code
+# 9) — the notebook is "locked" in importing state. Empirically the server
+# takes 30-60s to release that lock after a 30s client-side timeout.
+# Use this as the floor sleep when we either (a) detect partial server-side
+# success and shrink the retry batch, or (b) catch an explicit
+# FAILED_PRECONDITION on the import call.
+_MIN_SETTLE_AFTER_PARTIAL = 60.0
+_GRPC_FAILED_PRECONDITION = 9
+
+
 async def import_with_retry(
     client,
     notebook_id: str,
@@ -235,6 +246,12 @@ async def import_with_retry(
     duplicate-on-retry inflation that otherwise occurs when each retry re-adds
     a copy of the same sources (a single timeout cascade can otherwise inflate
     a 60-source import to 300+ sources across 5-6 retries).
+
+    On gRPC FAILED_PRECONDITION (code 9), treats the rejection as a
+    "server still busy" signal and retries after a longer settle delay
+    (`_MIN_SETTLE_AFTER_PARTIAL`). The same delay applies after the
+    timeout-and-shrink path, since the shrink itself is direct evidence that
+    the server is mid-write on the prior batch.
 
     This is intentionally CLI-only policy. Library consumers calling
     `client.research.import_sources()` directly still get one-shot behavior.
@@ -331,10 +348,32 @@ async def import_with_retry(
             requested_has_no_url_entry = _has_no_url_entry(sources)
 
     while True:
+        # Per-iteration flags that drive the retry-sleep decision below. Reset
+        # at the top of each attempt so a successful prior shrink doesn't
+        # extend a later, unrelated timeout's sleep.
+        did_shrink_this_iter = False
+        is_failed_precondition = False
         try:
             imported = await client.research.import_sources(notebook_id, task_id, sources)
             merged = _merge_imported_sources(imported, verified_imported, verified_imported_ids)
             return await _dedup_notebook_sources(client, notebook_id, merged)
+        except RPCError as e:
+            # FAILED_PRECONDITION (gRPC code 9) on IMPORT_RESEARCH means the
+            # server is still processing a prior import for this notebook and
+            # is rejecting new imports until that completes. Treat like a
+            # timeout but with a longer settle delay. Other RPCErrors are
+            # genuinely fatal here — re-raise.
+            if e.rpc_code != _GRPC_FAILED_PRECONDITION:
+                raise
+            is_failed_precondition = True
+            elapsed = time.monotonic() - started_at
+            remaining = max_elapsed - elapsed
+            logger.warning(
+                "IMPORT_RESEARCH rejected with FAILED_PRECONDITION for notebook "
+                "%s after %.1fs (server still processing prior batch); will "
+                "settle %.1fs and retry",
+                notebook_id, elapsed, _MIN_SETTLE_AFTER_PARTIAL,
+            )
         except RPCTimeoutError:
             elapsed = time.monotonic() - started_at
             remaining = max_elapsed - elapsed
@@ -391,6 +430,11 @@ async def import_with_retry(
                         source for source, url in source_norms if url not in current_urls_norm
                     ]
                     if len(filtered_sources) != len(sources):
+                        # Partial server-side success: some URLs are now
+                        # visible but our batch isn't fully done. The server
+                        # is mid-write — force a longer settle before retry
+                        # to avoid FAILED_PRECONDITION.
+                        did_shrink_this_iter = True
                         removed_count = len(sources) - len(filtered_sources)
                         for src in new_sources:
                             if (
@@ -453,9 +497,23 @@ async def import_with_retry(
                 )
                 raise
 
-            sleep_for = min(delay, max_delay, remaining)
+            # If the server is mid-write (we shrunk the batch from a partial
+            # success, or it just rejected with FAILED_PRECONDITION), the
+            # default 5s delay is too short — the next retry would race the
+            # in-flight import and trigger FAILED_PRECONDITION (or another
+            # one). Floor the sleep at `_MIN_SETTLE_AFTER_PARTIAL` in those
+            # cases. Still bound by `remaining` to respect max_elapsed.
+            if did_shrink_this_iter or is_failed_precondition:
+                sleep_for = min(max(delay, _MIN_SETTLE_AFTER_PARTIAL), remaining)
+            else:
+                sleep_for = min(delay, max_delay, remaining)
+            reason = (
+                "rejected (FAILED_PRECONDITION)" if is_failed_precondition
+                else "timed out"
+            )
             logger.warning(
-                "IMPORT_RESEARCH timed out for notebook %s; retrying in %.1fs (attempt %d, %.1fs elapsed)",
+                "IMPORT_RESEARCH %s for notebook %s; retrying in %.1fs (attempt %d, %.1fs elapsed)",
+                reason,
                 notebook_id,
                 sleep_for,
                 attempt + 1,
@@ -463,7 +521,7 @@ async def import_with_retry(
             )
             if not json_output:
                 console.print(
-                    f"[yellow]Import timed out; retrying in {sleep_for:.0f}s "
+                    f"[yellow]Import {reason}; retrying in {sleep_for:.0f}s "
                     f"(attempt {attempt + 1})[/yellow]"
                 )
             await asyncio.sleep(sleep_for)

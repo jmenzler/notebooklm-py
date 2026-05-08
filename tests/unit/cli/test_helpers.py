@@ -946,7 +946,9 @@ class TestImportWithRetry:
             {"url": "https://two.example.com", "title": "Source 2"},
             {"url": "https://three.example.com", "title": "Source 3"},
         ]
-        mock_sleep.assert_awaited_once_with(5)
+        # Partial-success shrink → server is mid-write; settle longer to avoid
+        # FAILED_PRECONDITION on retry. See _MIN_SETTLE_AFTER_PARTIAL.
+        mock_sleep.assert_awaited_once_with(60.0)
 
     @pytest.mark.asyncio
     async def test_partial_timeout_preserves_report_entries_for_retry(self):
@@ -1046,7 +1048,9 @@ class TestImportWithRetry:
         assert client.research.import_sources.await_count == 2
         retry_call_sources = client.research.import_sources.await_args_list[1].args[2]
         assert retry_call_sources == [{"url": "https://two.example.com", "title": "Source 2"}]
-        mock_sleep.assert_awaited_once_with(5)
+        # Partial-success shrink → server is mid-write; settle longer to avoid
+        # FAILED_PRECONDITION on retry. See _MIN_SETTLE_AFTER_PARTIAL.
+        mock_sleep.assert_awaited_once_with(60.0)
 
     @pytest.mark.asyncio
     async def test_partial_timeout_skips_retry_when_filter_removes_all_sources(self):
